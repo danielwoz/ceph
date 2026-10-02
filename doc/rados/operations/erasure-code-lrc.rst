@@ -283,7 +283,7 @@ Layers that do not set ``plugin`` use the EC backend named by
 backend/algorithm on a per-layer basis using the low-level
 configuration. The second argument in ``layers='[ [ "DDc", "" ] ]'``
 is actually an erasure code profile to be used for this level. The
-example below specifies the Jerasure backend with the cauchy technique to
+example below specifies the Jerasure backend with the cauchy_good technique to
 be used in the pool named ``lrcpool``:
 
 .. prompt:: bash #
@@ -291,7 +291,7 @@ be used in the pool named ``lrcpool``:
    ceph osd erasure-code-profile set LRCprofile \
       plugin=lrc \
       mapping=DD_ \
-      layers='[ [ "DDc", "plugin=jerasure technique=cauchy" ] ]'
+      layers='[ [ "DDc", "plugin=jerasure technique=cauchy_good" ] ]'
    ceph osd pool create lrcpool erasure LRCprofile
 
 You could also use a different erasure code profile for each
