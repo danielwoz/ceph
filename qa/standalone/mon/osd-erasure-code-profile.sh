@@ -234,6 +234,132 @@ function TEST_invalid_crush_failure_domain() {
     ! ceph osd erasure-code-profile set $profile k=4 m=2 crush-failure-domain=$crush_failure_domain 2>&1 || return 1
 }
 
+function TEST_lrc_default_layer_plugin() {
+    local dir=$1
+
+    local lrc="plugin=lrc k=4 m=2 l=3 crush-failure-domain=osd"
+    run_mon $dir a \
+        --osd_pool_default_erasure-code-profile "$lrc" || return 1
+    #
+    # require_osd_release is tentacle or later: a new LRC profile
+    # records isa for the layers that do not name a plugin
+    #
+    ceph osd erasure-code-profile get default | \
+        grep default-layer-plugin=isa || return 1
+    ceph osd erasure-code-profile set p $lrc || return 1
+    ceph osd erasure-code-profile get p | \
+        grep default-layer-plugin=isa || return 1
+    ceph osd erasure-code-profile set p $lrc || return 1
+    #
+    # an explicit value is kept and re-applying the profile without it
+    # keeps the recorded value
+    #
+    ceph osd erasure-code-profile set q $lrc \
+        default-layer-plugin=jerasure || return 1
+    ceph osd erasure-code-profile get q | \
+        grep default-layer-plugin=jerasure || return 1
+    ceph osd erasure-code-profile set q $lrc || return 1
+    ceph osd erasure-code-profile get q | \
+        grep default-layer-plugin=jerasure || return 1
+    #
+    # changing it is an override
+    #
+    expect_failure $dir 'will not override' \
+        ceph osd erasure-code-profile set q $lrc \
+        default-layer-plugin=isa || return 1
+    expect_failure $dir 'DANGEROUS' \
+        ceph osd erasure-code-profile set q $lrc \
+        default-layer-plugin=isa --force || return 1
+    ceph osd erasure-code-profile set q $lrc default-layer-plugin=isa \
+        --force --yes-i-really-mean-it > $dir/out 2>&1 || return 1
+    grep 'restart the OSDs' $dir/out || return 1
+    ceph osd erasure-code-profile get q | \
+        grep default-layer-plugin=isa || return 1
+
+    expect_failure $dir 'must be jerasure or isa' \
+        ceph osd erasure-code-profile set r $lrc \
+        default-layer-plugin=bogus || return 1
+    #
+    # a profile that was not LRC has no LRC pools: overriding it
+    # records the layer plugin as for a new profile
+    #
+    ceph osd erasure-code-profile set j plugin=jerasure k=2 m=1 || return 1
+    ceph osd erasure-code-profile set j $lrc \
+        --force --yes-i-really-mean-it || return 1
+    ceph osd erasure-code-profile get j | \
+        grep default-layer-plugin=isa || return 1
+    #
+    # a profile without the key, as created by monitors that do not
+    # record it, stays without it until isa or jerasure is set
+    # explicitly; isa does not need --force because it changes nothing
+    #
+    ceph config set mon mon_debug_no_lrc_layer_plugin_record true || return 1
+    ceph osd erasure-code-profile set s $lrc || return 1
+    ceph config set mon mon_debug_no_lrc_layer_plugin_record false || return 1
+    ! ceph osd erasure-code-profile get s | \
+        grep default-layer-plugin || return 1
+    ceph osd erasure-code-profile set s $lrc || return 1
+    ! ceph osd erasure-code-profile get s | \
+        grep default-layer-plugin || return 1
+    expect_failure $dir 'will not override' \
+        ceph osd erasure-code-profile set s $lrc \
+        default-layer-plugin=jerasure || return 1
+    ceph osd erasure-code-profile set s $lrc default-layer-plugin=isa \
+        > $dir/out 2>&1 || return 1
+    grep 'recorded default-layer-plugin=isa' $dir/out || return 1
+    ceph osd erasure-code-profile get s | \
+        grep default-layer-plugin=isa || return 1
+}
+
+function TEST_lrc_default_layer_plugin_pre_tentacle() {
+    local dir=$1
+
+    local lrc="plugin=lrc k=4 m=2 l=3 crush-failure-domain=osd"
+    run_mon $dir a \
+        --mon-debug-no-require-umbrella=true \
+        --mon-debug-no-require-tentacle=true \
+        --osd_pool_default_erasure-code-profile "$lrc" || return 1
+    ceph osd dump | grep 'require_osd_release squid' || return 1
+    #
+    # OSDs older than tentacle use jerasure for the layers that do not
+    # name a plugin and ignore the key
+    #
+    ceph osd erasure-code-profile get default | \
+        grep default-layer-plugin=jerasure || return 1
+    ceph osd erasure-code-profile set p $lrc || return 1
+    ceph osd erasure-code-profile get p | \
+        grep default-layer-plugin=jerasure || return 1
+    expect_failure $dir 'require_osd_release tentacle' \
+        ceph osd erasure-code-profile set q $lrc \
+        default-layer-plugin=isa || return 1
+    #
+    # the default profile records it too when it is created on demand
+    #
+    ceph osd erasure-code-profile rm default || return 1
+    ceph osd crush rule create-erasure lrcrule || return 1
+    ceph osd erasure-code-profile get default | \
+        grep default-layer-plugin=jerasure || return 1
+    ceph osd crush rule rm lrcrule || return 1
+    ceph osd erasure-code-profile rm default || return 1
+    ceph osd pool create lrcpool 1 1 erasure || return 1
+    ceph osd erasure-code-profile get default | \
+        grep default-layer-plugin=jerasure || return 1
+    #
+    # once an OSD running Tentacle or later has booted, a new profile
+    # may be used by OSDs that encode with isa: it must set the key
+    #
+    run_osd $dir 0 || return 1
+    expect_failure $dir 'set default-layer-plugin explicitly' \
+        ceph osd erasure-code-profile set r $lrc || return 1
+    ceph osd erasure-code-profile set r $lrc \
+        default-layer-plugin=isa || return 1
+    ceph osd erasure-code-profile set s $lrc \
+        default-layer-plugin=jerasure || return 1
+    ceph osd erasure-code-profile set p $lrc || return 1
+    ceph osd erasure-code-profile get p | \
+        grep default-layer-plugin=jerasure || return 1
+}
+
 main osd-erasure-code-profile "$@"
 
 # Local Variables:

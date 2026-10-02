@@ -2107,6 +2107,14 @@ options:
   - mon
   flags:
   - cluster_create
+- name: mon_debug_no_lrc_layer_plugin_record
+  type: bool
+  level: dev
+  desc: Do not record default-layer-plugin in LRC erasure code profiles, as
+    releases without it did (testing only)
+  default: false
+  services:
+  - mon
 - name: mon_debug_no_require_bluestore_for_ec_overwrites
   type: bool
   level: dev

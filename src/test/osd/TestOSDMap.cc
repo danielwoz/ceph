@@ -501,6 +501,36 @@ TEST_F(OSDMapTest, Features) {
   // FIXME: test tiering feature bits
 }
 
+TEST_F(OSDMapTest, AnyOsdHasFeature) {
+  set_up_map();
+  ASSERT_FALSE(osdmap.any_osd_has_feature(CEPH_FEATUREMASK_SERVER_TENTACLE));
+
+  {
+    OSDMap::Incremental inc(osdmap.get_epoch() + 1);
+    inc.new_xinfo[0] = osdmap.get_xinfo(0);
+    inc.new_xinfo[0].features = CEPH_FEATUREMASK_SERVER_SQUID;
+    osdmap.apply_incremental(inc);
+  }
+  ASSERT_FALSE(osdmap.any_osd_has_feature(CEPH_FEATUREMASK_SERVER_TENTACLE));
+
+  {
+    OSDMap::Incremental inc(osdmap.get_epoch() + 1);
+    inc.new_xinfo[1] = osdmap.get_xinfo(1);
+    inc.new_xinfo[1].features = CEPH_FEATUREMASK_SERVER_TENTACLE;
+    osdmap.apply_incremental(inc);
+  }
+  ASSERT_TRUE(osdmap.any_osd_has_feature(CEPH_FEATUREMASK_SERVER_TENTACLE));
+
+  // a down osd keeps its xinfo
+  {
+    OSDMap::Incremental inc(osdmap.get_epoch() + 1);
+    inc.new_state[1] = CEPH_OSD_UP;
+    osdmap.apply_incremental(inc);
+  }
+  ASSERT_TRUE(osdmap.is_down(1));
+  ASSERT_TRUE(osdmap.any_osd_has_feature(CEPH_FEATUREMASK_SERVER_TENTACLE));
+}
+
 TEST_F(OSDMapTest, MapPG) {
   set_up_map();
 

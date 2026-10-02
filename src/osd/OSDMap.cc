@@ -1918,6 +1918,16 @@ uint64_t OSDMap::get_up_osd_features() const
   return cached_up_osd_features;
 }
 
+bool OSDMap::any_osd_has_feature(uint64_t mask) const
+{
+  for (int osd = 0; osd < max_osd; ++osd) {
+    if (exists(osd) && (get_xinfo(osd).features & mask) == mask) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool OSDMap::any_osd_laggy() const
 {
   for (int osd = 0; osd < max_osd; ++osd) {

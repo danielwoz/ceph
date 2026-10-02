@@ -708,6 +708,21 @@ void OSDMonitor::create_initial()
   }
   newmap.require_min_compat_client = r;
 
+  // record the layer plugin of an LRC default profile, as
+  // prepare_lrc_layer_plugin() does for profiles created later
+  if (newmap.has_erasure_code_profile("default") &&
+      !g_conf().get_val<bool>("mon_debug_no_lrc_layer_plugin_record")) {
+    auto profile = newmap.get_erasure_code_profile("default");
+    auto plugin = profile.find("plugin");
+    if (plugin != profile.end() && plugin->second == "lrc" &&
+	!OSDMap::lrc_profile_has_layer_plugin(profile)) {
+      profile[OSDMap::LRC_LAYER_PLUGIN_KEY] =
+	newmap.require_osd_release < ceph_release_t::tentacle ?
+	"jerasure" : "isa";
+      newmap.set_erasure_code_profile("default", profile);
+    }
+  }
+
   // encode into pending incremental
   uint64_t features = newmap.get_encoding_features();
   newmap.encode(pending_inc.fullmap,
@@ -7759,6 +7774,75 @@ int OSDMonitor::normalize_profile(const string& profilename,
   return 0;
 }
 
+// true if an OSD has booted with the tentacle feature, or is booting
+// with it in the pending epoch
+bool OSDMonitor::any_osd_has_run_tentacle() const
+{
+  if (osdmap.any_osd_has_feature(CEPH_FEATUREMASK_SERVER_TENTACLE))
+    return true;
+  for (auto& [osd, xi] : pending_inc.new_xinfo) {
+    if (HAVE_FEATURE(xi.features, SERVER_TENTACLE))
+      return true;
+  }
+  return false;
+}
+
+// LRC layers that do not name a plugin used jerasure before Tentacle
+// and isa since. Record which one a new profile uses, so that a pool
+// keeps its codec when its OSDs are upgraded. An existing LRC profile
+// without the key is left alone: its pools may have been written with
+// either plugin.
+int OSDMonitor::prepare_lrc_layer_plugin(const string& profilename,
+					 ErasureCodeProfile &profile,
+					 ostream *ss)
+{
+  auto plugin = profile.find("plugin");
+  if (plugin == profile.end() || plugin->second != "lrc")
+    return 0;
+  const string key = OSDMap::LRC_LAYER_PLUGIN_KEY;
+  auto i = profile.find(key);
+  if (i != profile.end() && i->second.empty()) {
+    profile.erase(i);
+    i = profile.end();
+  }
+  bool pre_tentacle = osdmap.require_osd_release < ceph_release_t::tentacle;
+  if (i != profile.end()) {
+    if (i->second == "isa" && pre_tentacle &&
+	!HAVE_FEATURE(osdmap.get_up_osd_features(), SERVER_TENTACLE)) {
+      *ss << key << "=isa needs require_osd_release tentacle or later,"
+	  << " or every up OSD running Tentacle or later: older OSDs ignore"
+	  << " it and encode LRC layers with jerasure";
+      return -EINVAL;
+    }
+    return 0;
+  }
+  if (osdmap.has_erasure_code_profile(profilename)) {
+    const auto& existing = osdmap.get_erasure_code_profile(profilename);
+    auto p = existing.find("plugin");
+    if (p != existing.end() && p->second == "lrc") {
+      if (OSDMap::lrc_profile_has_layer_plugin(existing))
+	profile[key] = existing.find(key)->second;
+      return 0;
+    }
+    // a profile that was not LRC has no LRC pools to keep
+  }
+  if (g_conf().get_val<bool>("mon_debug_no_lrc_layer_plugin_record"))
+    return 0;
+  if (!pre_tentacle) {
+    profile[key] = "isa";
+  } else if (!any_osd_has_run_tentacle()) {
+    profile[key] = "jerasure";
+  } else {
+    // OSDs older than tentacle use jerasure, but an OSD running Tentacle
+    // or later without support for the key uses isa
+    *ss << "require_osd_release is older than tentacle, but OSDs running"
+	<< " Tentacle or later have booted and may encode LRC layers that"
+	<< " do not name a plugin with isa: set " << key << " explicitly";
+    return -EINVAL;
+  }
+  return 0;
+}
+
 int OSDMonitor::crush_rule_create_erasure(const string &name,
 					     const string &profile,
 					     int *rule,
@@ -12071,11 +12155,15 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
     }
 
     string plugin = profile_map["plugin"];
+    bool lrc = plugin == "lrc";
 
     if (pending_inc.has_erasure_code_profile(name)) {
       dout(20) << "erasure code profile " << name << " try again" << dendl;
       goto wait;
     } else {
+      err = prepare_lrc_layer_plugin(name, profile_map, &ss);
+      if (err)
+	goto reply_no_propose;
       err = normalize_profile(name, profile_map, force, &ss);
       if (err)
 	goto reply_no_propose;
@@ -12092,7 +12180,29 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
 	  goto reply_no_propose;
 	}
 
-	if (!force) {
+	const string key = OSDMap::LRC_LAYER_PLUGIN_KEY;
+	auto layer_plugin = [&key](const ErasureCodeProfile& p) {
+	  auto i = p.find(key);
+	  return i == p.end() || i->second.empty() ? string("isa") : i->second;
+	};
+	// LRC layers that do not name a plugin use isa when the key is
+	// absent, so recording isa in such a profile changes nothing.
+	bool record_isa = false;
+	if (lrc && !OSDMap::lrc_profile_has_layer_plugin(existing_profile_map)) {
+	  auto i = profile_map.find(key);
+	  if (i != profile_map.end() && i->second == "isa") {
+	    ErasureCodeProfile without_key = profile_map;
+	    without_key.erase(key);
+	    ErasureCodeProfile existing_without_key = existing_profile_map;
+	    existing_without_key.erase(key);
+	    record_isa = without_key == existing_without_key;
+	  }
+	}
+
+	if (record_isa) {
+	  ss << "recorded " << key << "=isa in erasure code profile " << name
+	     << "; pools using it keep the same layer plugin";
+	} else if (!force) {
 	  err = -EPERM;
 	  ss << "will not override erasure code profile " << name
 	     << " because the existing profile "
@@ -12105,6 +12215,12 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
 	  ss << "overriding erasure code profile can be DANGEROUS"
 	     << "; add --yes-i-really-mean-it to do it anyway";
 	  goto reply_no_propose;
+	} else if (lrc && existing_profile_map["plugin"] == "lrc" &&
+		   layer_plugin(existing_profile_map) !=
+		   layer_plugin(profile_map)) {
+	  ss << "erasure code profile " << name << " now uses " << key << "="
+	     << layer_plugin(profile_map) << "; restart the OSDs serving pools"
+	     << " that use it for this to take effect";
 	}
       }
 
@@ -12141,6 +12257,9 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
 	err = osdmap.get_erasure_code_profile_default(cct,
 						      profile_map,
 						      &ss);
+	if (err)
+	  goto reply_no_propose;
+	err = prepare_lrc_layer_plugin(profile, profile_map, &ss);
 	if (err)
 	  goto reply_no_propose;
 	err = normalize_profile(name, profile_map, true, &ss);
@@ -14090,6 +14209,9 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
 	  err = osdmap.get_erasure_code_profile_default(cct,
 						      profile_map,
 						      &ss);
+	  if (err)
+	    goto reply_no_propose;
+	  err = prepare_lrc_layer_plugin(erasure_code_profile, profile_map, &ss);
 	  if (err)
 	    goto reply_no_propose;
 	  dout(20) << "erasure code profile " << erasure_code_profile << " set" << dendl;

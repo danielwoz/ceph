@@ -509,6 +509,10 @@ private:
 			ceph::ErasureCodeProfile &profile,
 			bool force,
 			std::ostream *ss);
+  bool any_osd_has_run_tentacle() const;
+  int prepare_lrc_layer_plugin(const std::string& profilename,
+			       ceph::ErasureCodeProfile &profile,
+			       std::ostream *ss);
   int crush_rule_create_erasure(const std::string &name,
 				const std::string &profile,
 				int *rule,

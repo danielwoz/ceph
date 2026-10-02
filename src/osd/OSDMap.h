@@ -868,6 +868,15 @@ public:
     return (float)get_primary_affinity(o) / (float)CEPH_OSD_MAX_PRIMARY_AFFINITY;
   }
 
+  /// LRC profile key naming the plugin of layers that do not set one
+  static constexpr const char* LRC_LAYER_PLUGIN_KEY = "default-layer-plugin";
+  /// true if a profile sets LRC_LAYER_PLUGIN_KEY; empty is the same as unset
+  static bool lrc_profile_has_layer_plugin(
+    const std::map<std::string,std::string>& profile) {
+    auto i = profile.find(LRC_LAYER_PLUGIN_KEY);
+    return i != profile.end() && !i->second.empty();
+  }
+
   bool has_erasure_code_profile(const std::string &name) const {
     auto i = erasure_code_profiles.find(name);
     return i != erasure_code_profiles.end();
@@ -1137,6 +1146,12 @@ public:
    * get intersection of features supported by up osds
    */
   uint64_t get_up_osd_features() const;
+
+  /**
+   * true if any existing osd, up or down, last booted with all of the
+   * given feature bits
+   */
+  bool any_osd_has_feature(uint64_t mask) const;
 
   int get_num_pg_upmap_primaries() const { return pg_upmap_primaries.size(); };
   void get_upmap_pgs(std::vector<pg_t> *upmap_pgs) const;
