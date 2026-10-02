@@ -44,10 +44,12 @@
 #define ERROR_LRC_K_M_MODULO		-(MAX_ERRNO + 19)
 #define ERROR_LRC_K_MODULO		-(MAX_ERRNO + 20)
 #define ERROR_LRC_M_MODULO		-(MAX_ERRNO + 21)
+#define ERROR_LRC_LAYER_PLUGIN		-(MAX_ERRNO + 22)
 
 class ErasureCodeLrc final : public ceph::ErasureCode {
 public:
   static const std::string DEFAULT_KML;
+  static const std::string DEFAULT_LAYER_PLUGIN;
 
   struct Layer {
     explicit Layer(const std::string &_chunks_map) : chunks_map(_chunks_map) { }
@@ -62,6 +64,7 @@ public:
   };
   std::vector<Layer> layers;
   std::string directory;
+  std::string default_layer_plugin;
   unsigned int chunk_count;
   unsigned int data_chunk_count;
   std::string rule_root;
@@ -79,6 +82,7 @@ public:
 
   explicit ErasureCodeLrc(const std::string &dir)
     : directory(dir),
+      default_layer_plugin(DEFAULT_LAYER_PLUGIN),
       chunk_count(0), data_chunk_count(0), rule_root("default")
   {
     rule_steps.push_back(Step("chooseleaf", "host", 0));
@@ -143,6 +147,9 @@ public:
   virtual int parse(ceph::ErasureCodeProfile &profile, std::ostream *ss);
 
   int parse_kml(ceph::ErasureCodeProfile &profile, std::ostream *ss);
+
+  int parse_default_layer_plugin(const ceph::ErasureCodeProfile &profile,
+				 std::ostream *ss);
 
   int parse_rule(ceph::ErasureCodeProfile &profile, std::ostream *ss);
 

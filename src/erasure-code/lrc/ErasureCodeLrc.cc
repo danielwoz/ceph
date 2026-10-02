@@ -234,7 +234,7 @@ int ErasureCodeLrc::layers_init(ostream *ss)
     if (layer.profile.find("m") == layer.profile.end())
       layer.profile["m"] = stringify(layer.coding.size());
     if (layer.profile.find("plugin") == layer.profile.end())
-      layer.profile["plugin"] = "isa";
+      layer.profile["plugin"] = default_layer_plugin;
     if (layer.profile.find("technique") == layer.profile.end())
       layer.profile["technique"] = "reed_sol_van";
     int err = registry.factory(layer.profile["plugin"],
@@ -288,6 +288,27 @@ int ErasureCodeLrc::parse(ErasureCodeProfile &profile,
 }
 
 const string ErasureCodeLrc::DEFAULT_KML("-1");
+const string ErasureCodeLrc::DEFAULT_LAYER_PLUGIN("isa");
+
+// Plugin for the layers that do not name one. Releases before Tentacle
+// used jerasure, Tentacle and later use isa. The value is read but not
+// written back into the profile: the monitor decides when it is safe
+// to record it.
+int ErasureCodeLrc::parse_default_layer_plugin(const ErasureCodeProfile &profile,
+					       ostream *ss)
+{
+  default_layer_plugin = DEFAULT_LAYER_PLUGIN;
+  auto i = profile.find("default-layer-plugin");
+  if (i == profile.end() || i->second.empty())
+    return 0;
+  if (i->second != "jerasure" && i->second != "isa") {
+    *ss << "default-layer-plugin=" << i->second
+	<< " must be jerasure or isa" << std::endl;
+    return ERROR_LRC_LAYER_PLUGIN;
+  }
+  default_layer_plugin = i->second;
+  return 0;
+}
 
 int ErasureCodeLrc::parse_kml(ErasureCodeProfile &profile,
 			      ostream *ss)
@@ -501,6 +522,10 @@ int ErasureCodeLrc::init(ErasureCodeProfile &profile,
     return r;
 
   r = parse(profile, ss);
+  if (r)
+    return r;
+
+  r = parse_default_layer_plugin(profile, ss);
   if (r)
     return r;
 

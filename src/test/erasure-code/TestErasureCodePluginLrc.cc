@@ -41,6 +41,41 @@ TEST(ErasureCodePlugin, factory)
   EXPECT_TRUE(erasure_code.get());
 }
 
+TEST(ErasureCodePlugin, factory_default_layer_plugin)
+{
+  ErasureCodePluginRegistry &instance = ErasureCodePluginRegistry::instance();
+  {
+    ErasureCodeProfile profile;
+    profile["k"] = "4";
+    profile["m"] = "2";
+    profile["l"] = "3";
+    profile["default-layer-plugin"] = "jerasure";
+    ErasureCodeInterfaceRef erasure_code;
+    EXPECT_EQ(0, instance.factory("lrc",
+				  g_conf().get_val<std::string>("erasure_code_dir"),
+				  profile, &erasure_code, &cerr));
+    ASSERT_TRUE(erasure_code.get());
+    // the layers are not visible here, TestErasureCodeLrc checks which
+    // plugin they use; this only checks that the key is kept
+    const ErasureCodeProfile &p = erasure_code->get_profile();
+    ASSERT_EQ(1U, p.count("default-layer-plugin"));
+    EXPECT_EQ("jerasure", p.find("default-layer-plugin")->second);
+  }
+  {
+    ErasureCodeProfile profile;
+    profile["k"] = "4";
+    profile["m"] = "2";
+    profile["l"] = "3";
+    profile["default-layer-plugin"] = "foo";
+    ErasureCodeInterfaceRef erasure_code;
+    stringstream ss;
+    EXPECT_NE(0, instance.factory("lrc",
+				  g_conf().get_val<std::string>("erasure_code_dir"),
+				  profile, &erasure_code, &ss));
+    EXPECT_FALSE(erasure_code);
+  }
+}
+
 /*
  * Local Variables:
  * compile-command: "cd ../.. ; make -j4 &&

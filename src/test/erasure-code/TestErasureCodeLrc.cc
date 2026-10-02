@@ -931,6 +931,226 @@ TEST(ErasureCodeLrc, encode_decode_2)
   }
 }
 
+static void kml_profile(ErasureCodeProfile *profile)
+{
+  (*profile)["k"] = "4";
+  (*profile)["m"] = "2";
+  (*profile)["l"] = "3";
+}
+
+// The content of the v0.92 corpus case "plugin=lrc stripe-width=4096
+// k=4 m=2 l=3": a 37 byte payload repeated up to the stripe width.
+static bufferlist corpus_v0_92_content()
+{
+  const unsigned stripe_width = 4096;
+  const string payload("nwlrbbmqbhcdarzowkkyhiddqscdxrjmowfrx");
+  bufferlist in;
+  for (unsigned j = 0; j < stripe_width; j += payload.size())
+    in.append(payload);
+  in.splice(stripe_width, in.length() - stripe_width);
+  return in;
+}
+
+static void encode_all(ErasureCodeLrc &lrc, const bufferlist &in,
+		       shard_id_map<bufferlist> *encoded)
+{
+  shard_id_set want_to_encode;
+  for (shard_id_t i; i < lrc.get_chunk_count(); ++i)
+    want_to_encode.insert(i);
+  ASSERT_EQ(0, lrc.encode(want_to_encode, in, encoded));
+}
+
+TEST(ErasureCodeLrc, default_layer_plugin_kml)
+{
+  // without default-layer-plugin the layers use isa and the key is not
+  // added to the profile
+  {
+    ErasureCodeLrc lrc(g_conf().get_val<std::string>("erasure_code_dir"));
+    ErasureCodeProfile profile;
+    kml_profile(&profile);
+    EXPECT_EQ(0, lrc.init(profile, &cerr));
+    ASSERT_EQ(3U, lrc.layers.size());
+    for (auto &layer : lrc.layers)
+      EXPECT_EQ("isa", layer.profile["plugin"]);
+    EXPECT_EQ(0U, profile.count("default-layer-plugin"));
+    EXPECT_EQ(0U, lrc.get_profile().count("default-layer-plugin"));
+  }
+  {
+    ErasureCodeLrc lrc(g_conf().get_val<std::string>("erasure_code_dir"));
+    ErasureCodeProfile profile;
+    kml_profile(&profile);
+    profile["default-layer-plugin"] = "jerasure";
+    EXPECT_EQ(0, lrc.init(profile, &cerr));
+    ASSERT_EQ(3U, lrc.layers.size());
+    for (auto &layer : lrc.layers)
+      EXPECT_EQ("jerasure", layer.profile["plugin"]);
+    EXPECT_EQ("jerasure", profile["default-layer-plugin"]);
+    EXPECT_EQ("jerasure", lrc.get_profile().at("default-layer-plugin"));
+    EXPECT_EQ(0U, profile.count("mapping"));
+    EXPECT_EQ(0U, profile.count("layers"));
+    // the monitor initializes the same profile twice
+    ErasureCodeProfile first = profile;
+    EXPECT_EQ(0, lrc.init(profile, &cerr));
+    EXPECT_EQ(first, profile);
+  }
+  // an empty value is the same as no value
+  {
+    ErasureCodeLrc lrc(g_conf().get_val<std::string>("erasure_code_dir"));
+    ErasureCodeProfile profile;
+    kml_profile(&profile);
+    profile["default-layer-plugin"] = "";
+    EXPECT_EQ(0, lrc.init(profile, &cerr));
+    ASSERT_EQ(3U, lrc.layers.size());
+    for (auto &layer : lrc.layers)
+      EXPECT_EQ("isa", layer.profile["plugin"]);
+  }
+}
+
+TEST(ErasureCodeLrc, default_layer_plugin_explicit_layer_wins)
+{
+  ErasureCodeLrc lrc(g_conf().get_val<std::string>("erasure_code_dir"));
+  ErasureCodeProfile profile;
+  profile["mapping"] =
+    "DD__DD__";
+  const char *description_string =
+    "[ "
+    " [ \"DDc_DDc_\", { \"plugin\": \"isa\" } ],"
+    " [ \"DDDc____\", \"\" ],"
+    " [ \"____DDDc\", \"\" ],"
+    "]";
+  profile["layers"] = description_string;
+  profile["default-layer-plugin"] = "jerasure";
+  EXPECT_EQ(0, lrc.init(profile, &cerr));
+  ASSERT_EQ(3U, lrc.layers.size());
+  EXPECT_EQ("isa", lrc.layers[0].profile["plugin"]);
+  EXPECT_EQ("jerasure", lrc.layers[1].profile["plugin"]);
+  EXPECT_EQ("jerasure", lrc.layers[2].profile["plugin"]);
+}
+
+TEST(ErasureCodeLrc, default_layer_plugin_invalid)
+{
+  for (const char *plugin : { "foo", "shec", "jerasure_generic" }) {
+    ErasureCodeLrc lrc(g_conf().get_val<std::string>("erasure_code_dir"));
+    ErasureCodeProfile profile;
+    kml_profile(&profile);
+    profile["default-layer-plugin"] = plugin;
+    stringstream ss;
+    EXPECT_EQ(ERROR_LRC_LAYER_PLUGIN, lrc.init(profile, &ss)) << plugin;
+    EXPECT_NE(string::npos, ss.str().find("must be jerasure or isa"));
+  }
+}
+
+TEST(ErasureCodeLrc, default_layer_plugin_corpus_v0_92)
+{
+  // crc32c of the chunks of the v0.92 corpus case "plugin=lrc
+  // stripe-width=4096 k=4 m=2 l=3", written when the layers used
+  // jerasure. Chunks 0, 1, 4 and 5 are data chunks.
+  const uint32_t corpus_crc[] = {
+    0x369583b7, 0x3794c7cf, 0xc986b44f, 0xc887f037,
+    0x68f0dfef, 0xb1260e5b, 0x528871d3, 0x8b5ea067
+  };
+  const unsigned int chunk_size = 1024;
+  bufferlist in = corpus_v0_92_content();
+
+  ErasureCodeLrc jerasure(g_conf().get_val<std::string>("erasure_code_dir"));
+  {
+    ErasureCodeProfile profile;
+    kml_profile(&profile);
+    profile["default-layer-plugin"] = "jerasure";
+    ASSERT_EQ(0, jerasure.init(profile, &cerr));
+  }
+  ASSERT_EQ(8U, jerasure.get_chunk_count());
+  shard_id_map<bufferlist> encoded(jerasure.get_chunk_count());
+  encode_all(jerasure, in, &encoded);
+  ASSERT_EQ(8U, encoded.size());
+  for (shard_id_t i; i < 8; ++i) {
+    EXPECT_EQ(chunk_size, encoded[i].length());
+    EXPECT_EQ(corpus_crc[int(i)], encoded[i].crc32c(-1)) << "chunk " << i;
+  }
+
+  // isa gives the same first parity chunk of each layer but not the
+  // second parity chunk of the global layer (6), nor the local parity
+  // chunk (7) computed from it
+  ErasureCodeLrc isa(g_conf().get_val<std::string>("erasure_code_dir"));
+  {
+    ErasureCodeProfile profile;
+    kml_profile(&profile);
+    ASSERT_EQ(0, isa.init(profile, &cerr));
+  }
+  {
+    shard_id_map<bufferlist> isa_encoded(isa.get_chunk_count());
+    encode_all(isa, in, &isa_encoded);
+    ASSERT_EQ(8U, isa_encoded.size());
+    for (shard_id_t i; i < 6; ++i)
+      EXPECT_EQ(corpus_crc[int(i)], isa_encoded[i].crc32c(-1)) << "chunk " << i;
+    for (shard_id_t i(6); i < 8; ++i)
+      EXPECT_NE(corpus_crc[int(i)], isa_encoded[i].crc32c(-1)) << "chunk " << i;
+  }
+
+  // Lose chunks 0 and 1: their local layer cannot repair them, so the
+  // global layer decodes them with both of its parity chunks.
+  shard_id_set want_to_read;
+  want_to_read.insert(shard_id_t(0));
+  want_to_read.insert(shard_id_t(1));
+  shard_id_map<bufferlist> available(jerasure.get_chunk_count());
+  for (shard_id_t i(2); i < 8; ++i)
+    available[i] = encoded[i];
+  {
+    shard_id_map<bufferlist> decoded(jerasure.get_chunk_count());
+    EXPECT_EQ(0, jerasure.decode(want_to_read, available, &decoded,
+				 chunk_size));
+    EXPECT_EQ(corpus_crc[0], decoded[shard_id_t(0)].crc32c(-1));
+    EXPECT_EQ(corpus_crc[1], decoded[shard_id_t(1)].crc32c(-1));
+  }
+  // isa does not recover chunks written with jerasure
+  {
+    shard_id_map<bufferlist> decoded(isa.get_chunk_count());
+    int r = isa.decode(want_to_read, available, &decoded, chunk_size);
+    EXPECT_TRUE(r != 0 ||
+		decoded[shard_id_t(0)].crc32c(-1) != corpus_crc[0] ||
+		decoded[shard_id_t(1)].crc32c(-1) != corpus_crc[1]);
+  }
+}
+
+TEST(ErasureCodeLrc, default_layer_plugin_kml_equals_explicit)
+{
+  bufferlist in = corpus_v0_92_content();
+  for (const string& plugin : { "jerasure", "isa" }) {
+    ErasureCodeLrc kml(g_conf().get_val<std::string>("erasure_code_dir"));
+    {
+      ErasureCodeProfile profile;
+      kml_profile(&profile);
+      profile["default-layer-plugin"] = plugin;
+      ASSERT_EQ(0, kml.init(profile, &cerr));
+    }
+    ErasureCodeLrc explicit_layers(
+      g_conf().get_val<std::string>("erasure_code_dir"));
+    {
+      ErasureCodeProfile profile;
+      profile["mapping"] =
+	"DD__DD__";
+      const string config = "{ \"plugin\": \"" + plugin + "\" }";
+      profile["layers"] =
+	"[ "
+	" [ \"DDc_DDc_\", " + config + " ],"
+	" [ \"DDDc____\", " + config + " ],"
+	" [ \"____DDDc\", " + config + " ],"
+	"]";
+      ASSERT_EQ(0, explicit_layers.init(profile, &cerr));
+    }
+    shard_id_map<bufferlist> kml_encoded(kml.get_chunk_count());
+    encode_all(kml, in, &kml_encoded);
+    shard_id_map<bufferlist> explicit_encoded(
+      explicit_layers.get_chunk_count());
+    encode_all(explicit_layers, in, &explicit_encoded);
+    ASSERT_EQ(8U, kml_encoded.size());
+    ASSERT_EQ(8U, explicit_encoded.size());
+    for (shard_id_t i; i < 8; ++i)
+      EXPECT_TRUE(kml_encoded[i].contents_equal(explicit_encoded[i]))
+	<< plugin << " chunk " << i;
+  }
+}
+
 /*
  * Local Variables:
  * compile-command: "cd ../.. ;
