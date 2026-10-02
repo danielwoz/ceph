@@ -531,6 +531,117 @@ TEST_F(OSDMapTest, AnyOsdHasFeature) {
   ASSERT_TRUE(osdmap.any_osd_has_feature(CEPH_FEATUREMASK_SERVER_TENTACLE));
 }
 
+TEST_F(OSDMapTest, LrcProfileHasImplicitLayer) {
+  map<string,string> kml = {{"plugin", "lrc"}, {"k", "4"}, {"m", "2"},
+                            {"l", "3"}};
+  ASSERT_TRUE(OSDMap::lrc_profile_has_implicit_layer(kml));
+
+  auto with_layers = [](const string& layers) {
+    return map<string,string>{{"plugin", "lrc"}, {"mapping", "DD__DD__"},
+                              {"layers", layers}};
+  };
+  // a layer configuration without a plugin
+  ASSERT_TRUE(OSDMap::lrc_profile_has_implicit_layer(with_layers(
+    R"([["DDc_DDc_",""],["DDDc____",""],["____DDDc",""]])")));
+  ASSERT_TRUE(OSDMap::lrc_profile_has_implicit_layer(with_layers(
+    R"([["DDc_DDc_","plugin=isa"],["DDDc____","k=3 m=1"]])")));
+  ASSERT_TRUE(OSDMap::lrc_profile_has_implicit_layer(with_layers(
+    R"([["DDc_DDc_",{"plugin":"isa"}],)"
+    R"(["DDDc____",{"technique":"reed_sol_van"}]])")));
+  ASSERT_TRUE(OSDMap::lrc_profile_has_implicit_layer(with_layers(
+    R"([["DDc_DDc_",{"plugin":"isa"}],["DDDc____"]])")));
+  // every layer names a plugin
+  ASSERT_FALSE(OSDMap::lrc_profile_has_implicit_layer(with_layers(
+    R"([["DDc_DDc_","plugin=isa"],)"
+    R"(["DDDc____","plugin=jerasure technique=reed_sol_van"],)"
+    R"(["____DDDc","{\"plugin\":\"jerasure\"}"]])")));
+  ASSERT_FALSE(OSDMap::lrc_profile_has_implicit_layer(with_layers(
+    R"([["DDc_DDc_",{"plugin":"isa"}],["DDDc____",{"plugin":"jerasure"}],)"
+    R"(["____DDDc",{"plugin":"jerasure"}]])")));
+  // anything that cannot be parsed counts as implicit
+  ASSERT_TRUE(OSDMap::lrc_profile_has_implicit_layer(with_layers(
+    R"([["DDc_DDc_",{"plugin":"isa"})")));
+  ASSERT_TRUE(OSDMap::lrc_profile_has_implicit_layer(with_layers(
+    R"({"DDc_DDc_":{"plugin":"isa"}})")));
+  ASSERT_TRUE(OSDMap::lrc_profile_has_implicit_layer(with_layers(
+    R"(["DDc_DDc_"])")));
+  ASSERT_TRUE(OSDMap::lrc_profile_has_implicit_layer(with_layers(
+    R"([["DDc_DDc_",1]])")));
+
+  ASSERT_TRUE(OSDMap::lrc_profile_needs_layer_plugin(kml));
+  kml[OSDMap::LRC_LAYER_PLUGIN_KEY] = "";
+  ASSERT_TRUE(OSDMap::lrc_profile_needs_layer_plugin(kml));
+  kml[OSDMap::LRC_LAYER_PLUGIN_KEY] = "jerasure";
+  ASSERT_FALSE(OSDMap::lrc_profile_needs_layer_plugin(kml));
+  map<string,string> jerasure = {{"plugin", "jerasure"}, {"k", "2"},
+                                 {"m", "1"}};
+  ASSERT_FALSE(OSDMap::lrc_profile_needs_layer_plugin(jerasure));
+}
+
+TEST_F(OSDMapTest, LrcLayerPluginUnsetHealth) {
+  set_up_map();
+
+  const string lrc_layers =
+    R"([["DDc_DDc_",{"plugin":"isa"}],["DDDc____",""],["____DDDc",""]])";
+  const string pinned_layers =
+    R"([["DDc_DDc_",{"plugin":"isa"}],["DDDc____","plugin=jerasure"],)"
+    R"(["____DDDc",{"plugin":"jerasure"}]])";
+  const utime_t create_time(1700000000, 0);
+  {
+    OSDMap::Incremental inc(osdmap.get_epoch() + 1);
+    inc.new_pool_max = osdmap.get_pool_max();
+    inc.fsid = osdmap.get_fsid();
+    map<string,string> kml = {{"plugin", "lrc"}, {"k", "4"}, {"m", "2"},
+                              {"l", "3"}, {"crush-failure-domain", "osd"}};
+    inc.new_erasure_code_profiles["kml"] = kml;
+    inc.new_erasure_code_profiles["unused"] = kml;
+    kml[OSDMap::LRC_LAYER_PLUGIN_KEY] = "jerasure";
+    inc.new_erasure_code_profiles["recorded"] = kml;
+    inc.new_erasure_code_profiles["pinned"] = {
+      {"plugin", "lrc"}, {"mapping", "DD__DD__"}, {"layers", pinned_layers}};
+    inc.new_erasure_code_profiles["layers"] = {
+      {"plugin", "lrc"}, {"mapping", "DD__DD__"}, {"layers", lrc_layers}};
+    inc.new_erasure_code_profiles["jer"] = {
+      {"plugin", "jerasure"}, {"k", "2"}, {"m", "1"}};
+    for (auto& profile : {"kml", "recorded", "pinned", "layers", "jer"}) {
+      uint64_t pool_id = set_ec_pool(string("pool_") + profile, inc, false);
+      auto& pool = inc.new_pools[pool_id];
+      pool.erasure_code_profile = profile;
+      pool.create_time = create_time;
+    }
+    osdmap.apply_incremental(inc);
+  }
+
+  health_check_map_t checks;
+  osdmap.check_health(g_ceph_context, &checks);
+  ASSERT_EQ(1u, checks.checks.count("POOL_LRC_LAYER_PLUGIN_UNSET"));
+  auto& check = checks.checks["POOL_LRC_LAYER_PLUGIN_UNSET"];
+  ASSERT_EQ(2, check.count);
+  ASSERT_EQ(2u, check.detail.size());
+  ASSERT_EQ("2 pool(s) use an LRC erasure code profile that does not "
+            "record its layer plugin", check.summary);
+  string detail;
+  for (auto& line : check.detail) {
+    detail += line + "\n";
+  }
+  ASSERT_NE(string::npos, detail.find(
+    "pool 'pool_kml' (erasure code profile 'kml', created " +
+    stringify(create_time) + ") decodes LRC layers that do not name a "
+    "plugin with isa"));
+  ASSERT_NE(string::npos, detail.find(
+    "pool 'pool_layers' (erasure code profile 'layers', created "));
+  ASSERT_EQ(string::npos, detail.find("pool_recorded"));
+  ASSERT_EQ(string::npos, detail.find("pool_pinned"));
+  ASSERT_EQ(string::npos, detail.find("pool_jer"));
+  ASSERT_EQ(string::npos, detail.find("unused"));
+
+  g_ceph_context->_conf.set_val("mon_warn_on_lrc_layer_plugin_unset", "false");
+  checks = health_check_map_t();
+  osdmap.check_health(g_ceph_context, &checks);
+  g_ceph_context->_conf.set_val("mon_warn_on_lrc_layer_plugin_unset", "true");
+  ASSERT_EQ(0u, checks.checks.count("POOL_LRC_LAYER_PLUGIN_UNSET"));
+}
+
 TEST_F(OSDMapTest, MapPG) {
   set_up_map();
 

@@ -597,6 +597,17 @@ options:
   see_also:
   - osd_pool_default_size
   - osd_pool_default_min_size
+- name: mon_warn_on_lrc_layer_plugin_unset
+  type: bool
+  level: advanced
+  desc: Issue POOL_LRC_LAYER_PLUGIN_UNSET health warning if a pool uses an
+    LRC erasure code profile that does not record its layer plugin
+  fmt_desc: Raise the ``POOL_LRC_LAYER_PLUGIN_UNSET`` ``HEALTH_WARN`` when
+    an erasure-coded pool uses an LRC profile without
+    ``default-layer-plugin`` and with layers that do not name a plugin.
+  default: true
+  services:
+  - mon
 - name: mon_warn_on_osd_down_out_interval_zero
   type: bool
   level: advanced

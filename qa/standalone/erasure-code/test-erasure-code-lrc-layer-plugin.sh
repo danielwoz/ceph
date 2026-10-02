@@ -316,6 +316,14 @@ function TEST_lrc_record_pre_tentacle() {
     sleep 15 # a few ticks
     ! ceph osd erasure-code-profile get p3 | \
         grep default-layer-plugin || return 1
+    #
+    # a pool using it gets a health warning, the pool using p1 does not
+    #
+    create_pool lrcpool3 1 1 erasure p3 || return 1
+    wait_for_health POOL_LRC_LAYER_PLUGIN_UNSET || return 1
+    ceph health detail > $dir/health || return 1
+    grep "pool 'lrcpool3' (erasure code profile 'p3'" $dir/health || return 1
+    ! grep "pool '$poolname'" $dir/health || return 1
 
     teardown $dir || return 1
 }

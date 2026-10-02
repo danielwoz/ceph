@@ -37,6 +37,7 @@
 #include "include/ceph_features.h"
 #include "include/common_fwd.h"
 #include "include/str_map.h"
+#include "json_spirit/json_spirit.h"
 
 #include "common/code_environment.h"
 #include "mon/health_check.h"
@@ -4932,6 +4933,50 @@ int OSDMap::get_erasure_code_profile_default(CephContext *cct,
   return r;
 }
 
+bool OSDMap::lrc_profile_has_implicit_layer(
+  const map<string,string>& profile)
+{
+  // k/m/l profiles do not store their generated layers, which never
+  // name a plugin. Anything that cannot be parsed counts as implicit.
+  auto i = profile.find("layers");
+  if (i == profile.end())
+    return true;
+  json_spirit::mValue json;
+  if (!json_spirit::read(i->second, json) ||
+      json.type() != json_spirit::array_type)
+    return true;
+  for (auto& layer : json.get_array()) {
+    if (layer.type() != json_spirit::array_type ||
+	layer.get_array().size() < 2)
+      return true;
+    auto& config = layer.get_array()[1];
+    if (config.type() == json_spirit::str_type) {
+      map<string,string> config_map;
+      ostringstream ss;
+      if (get_json_str_map(config.get_str(), ss, &config_map) ||
+	  config_map.find("plugin") == config_map.end())
+	return true;
+    } else if (config.type() == json_spirit::obj_type) {
+      auto& o = config.get_obj();
+      if (o.find("plugin") == o.end())
+	return true;
+    } else {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool OSDMap::lrc_profile_needs_layer_plugin(
+  const map<string,string>& profile)
+{
+  auto i = profile.find("plugin");
+  if (i == profile.end() || i->second != "lrc" ||
+      lrc_profile_has_layer_plugin(profile))
+    return false;
+  return lrc_profile_has_implicit_layer(profile);
+}
+
 int OSDMap::_build_crush_types(CrushWrapper& crush)
 {
   crush.set_type_name(0, "osd");
@@ -8091,6 +8136,33 @@ void OSDMap::check_health(CephContext *cct,
       ss << detail.size() << " pool(s) have no replicas configured";
       auto& d = checks->add("POOL_NO_REDUNDANCY", HEALTH_WARN,
         ss.str(), detail.size());
+      d.detail.swap(detail);
+    }
+  }
+
+  // POOL_LRC_LAYER_PLUGIN_UNSET
+  if (cct->_conf.get_val<bool>("mon_warn_on_lrc_layer_plugin_unset")) {
+    list<string> detail;
+    for (auto& [pool_id, pool] : get_pools()) {
+      if (!pool.is_erasure() ||
+	  !lrc_profile_needs_layer_plugin(
+	    get_erasure_code_profile(pool.erasure_code_profile)))
+	continue;
+      ostringstream ss;
+      ss << "pool '" << get_pool_name(pool_id)
+	 << "' (erasure code profile '" << pool.erasure_code_profile
+	 << "', created " << pool.get_create_time()
+	 << ") decodes LRC layers that do not name a plugin with isa;"
+	 << " pools created before the upgrade to Tentacle need "
+	 << LRC_LAYER_PLUGIN_KEY << "=jerasure";
+      detail.push_back(ss.str());
+    }
+    if (!detail.empty()) {
+      ostringstream ss;
+      ss << detail.size() << " pool(s) use an LRC erasure code profile"
+	 << " that does not record its layer plugin";
+      auto& d = checks->add("POOL_LRC_LAYER_PLUGIN_UNSET", HEALTH_WARN,
+			    ss.str(), detail.size());
       d.detail.swap(detail);
     }
   }

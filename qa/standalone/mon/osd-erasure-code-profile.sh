@@ -366,6 +366,55 @@ function TEST_lrc_default_layer_plugin_pre_tentacle() {
         grep default-layer-plugin=jerasure || return 1
 }
 
+function TEST_lrc_layer_plugin_unset_health() {
+    local dir=$1
+
+    run_mon $dir a || return 1
+
+    local lrc="plugin=lrc k=4 m=2 l=3 crush-failure-domain=osd"
+    #
+    # a pool created by monitors that do not record the layer plugin
+    #
+    ceph config set mon mon_debug_no_lrc_layer_plugin_record true || return 1
+    ceph osd erasure-code-profile set p3 $lrc || return 1
+    ! ceph osd erasure-code-profile get p3 | \
+        grep default-layer-plugin || return 1
+    create_pool lrcpool 4 4 erasure p3 || return 1
+    ceph config set mon mon_debug_no_lrc_layer_plugin_record false || return 1
+    wait_for_health POOL_LRC_LAYER_PLUGIN_UNSET || return 1
+    ceph health detail > $dir/health || return 1
+    grep "pool 'lrcpool' (erasure code profile 'p3', created " \
+        $dir/health || return 1
+    #
+    # re-applying the profile does not record anything
+    #
+    ceph osd erasure-code-profile set p3 $lrc || return 1
+    ! ceph osd erasure-code-profile get p3 | \
+        grep default-layer-plugin || return 1
+    expect_failure $dir 'will not override' \
+        ceph osd erasure-code-profile set p3 $lrc \
+        default-layer-plugin=jerasure || return 1
+    #
+    # recording isa changes nothing and clears the warning
+    #
+    ceph osd erasure-code-profile set p3 $lrc default-layer-plugin=isa \
+        > $dir/out 2>&1 || return 1
+    grep 'recorded default-layer-plugin=isa' $dir/out || return 1
+    wait_for_health_gone POOL_LRC_LAYER_PLUGIN_UNSET || return 1
+    #
+    # the warning can be disabled
+    #
+    ceph config set mon mon_debug_no_lrc_layer_plugin_record true || return 1
+    ceph osd erasure-code-profile set p4 $lrc || return 1
+    create_pool lrcpool2 4 4 erasure p4 || return 1
+    ceph config set mon mon_debug_no_lrc_layer_plugin_record false || return 1
+    wait_for_health "pool 'lrcpool2'" || return 1
+    ceph config set mon mon_warn_on_lrc_layer_plugin_unset false || return 1
+    # the check runs when the next osdmap is proposed
+    ceph osd pool application enable lrcpool2 rados || return 1
+    wait_for_health_gone POOL_LRC_LAYER_PLUGIN_UNSET || return 1
+}
+
 main osd-erasure-code-profile "$@"
 
 # Local Variables:

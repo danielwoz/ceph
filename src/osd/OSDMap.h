@@ -876,6 +876,12 @@ public:
     auto i = profile.find(LRC_LAYER_PLUGIN_KEY);
     return i != profile.end() && !i->second.empty();
   }
+  /// true if an LRC profile has a layer that does not name its plugin
+  static bool lrc_profile_has_implicit_layer(
+    const std::map<std::string,std::string>& profile);
+  /// true if an LRC profile has such a layer and no LRC_LAYER_PLUGIN_KEY
+  static bool lrc_profile_needs_layer_plugin(
+    const std::map<std::string,std::string>& profile);
 
   bool has_erasure_code_profile(const std::string &name) const {
     auto i = erasure_code_profiles.find(name);
