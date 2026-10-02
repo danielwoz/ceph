@@ -137,6 +137,14 @@ int ErasureCodeNonRegression::setup(int argc, char** argv) {
     }
   }
 
+  // The LRC corpus was created before Tentacle, when layers that do not
+  // name a plugin used jerasure. Keep using jerasure for directories
+  // that do not set default-layer-plugin, both when creating and when
+  // checking, so that their names mean the same thing.
+  if (plugin == "lrc" &&
+      profile.find("default-layer-plugin") == profile.end())
+    profile["default-layer-plugin"] = "jerasure";
+
   return 0;
 }
 
