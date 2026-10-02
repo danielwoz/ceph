@@ -218,4 +218,106 @@ function TEST_lrc_layer_plugin_change_applies_on_restart() {
     teardown $dir || return 1
 }
 
+# The first monitor that records default-layer-plugin finds LRC
+# profiles without it, written by older monitors. While no OSD has run
+# Tentacle or later their layers were all encoded with jerasure, and the
+# monitor records that.
+function TEST_lrc_record_pre_tentacle() {
+    local dir=$1
+    local poolname=lrcpool
+    local lrc="plugin=lrc k=4 m=2 l=3 crush-failure-domain=osd"
+
+    setup $dir || return 1
+    run_mon $dir a \
+        --mon-debug-no-require-umbrella=true \
+        --mon-debug-no-require-tentacle=true || return 1
+    run_mgr $dir x || return 1
+    ceph osd dump | grep 'require_osd_release squid' || return 1
+    #
+    # an older monitor creates the profile and the pool, before any OSD
+    # is upgraded
+    #
+    ceph config set mon mon_debug_no_lrc_layer_plugin_record true || return 1
+    ceph osd erasure-code-profile set p1 $lrc || return 1
+    ! ceph osd erasure-code-profile get p1 | \
+        grep default-layer-plugin || return 1
+    create_pool $poolname 1 1 erasure p1 || return 1
+    #
+    # upgraded monitor: no OSD has booted, so jerasure is recorded
+    #
+    ceph config set mon mon_debug_no_lrc_layer_plugin_record false || return 1
+    local -i i
+    for ((i = 0; i < 60; i++)) ; do
+        ceph osd erasure-code-profile get p1 | \
+            grep default-layer-plugin=jerasure && break
+        sleep 1
+    done
+    ceph osd erasure-code-profile get p1 | \
+        grep default-layer-plugin=jerasure || return 1
+    for ((i = 0; i < 30; i++)) ; do
+        ceph log last 100 | grep "recorded default-layer-plugin=jerasure in erasure code profile 'p1'" && break
+        sleep 1
+    done
+    ceph log last 100 | grep "recorded default-layer-plugin=jerasure in erasure code profile 'p1'" || return 1
+    ceph osd erasure-code-profile get p1 > $dir/p1.before || return 1
+    ceph osd erasure-code-profile set p1 $lrc || return 1
+    ceph osd erasure-code-profile get p1 > $dir/p1.after || return 1
+    diff $dir/p1.before $dir/p1.after || return 1
+    #
+    # the OSDs encode the pool with jerasure
+    #
+    local id
+    for id in $(seq 0 7) ; do
+        run_osd $dir $id || return 1
+    done
+    wait_for_clean || return 1
+    local stripe_width=$(ceph osd pool ls detail -f json | \
+        jq ".[] | select(.pool_name == \"$poolname\") | .stripe_width")
+    local stripe_unit=$((stripe_width / 4))
+    head -c $stripe_width /dev/urandom > $dir/obj || return 1
+    rados --pool $poolname put obj $dir/obj || return 1
+    local plugin
+    for plugin in jerasure isa ; do
+        ceph-erasure-code-tool encode \
+            plugin=lrc,k=4,m=2,l=3,default-layer-plugin=$plugin \
+            $stripe_unit 0,1,2,3,4,5,6,7 $dir/obj || return 1
+        for id in $(seq 0 7) ; do
+            mv $dir/obj.$id $dir/$plugin.$id || return 1
+        done
+    done
+    local -a osds=($(get_osds $poolname obj))
+    local differ=0
+    local shard
+    for shard in $(seq 0 7) ; do
+        cmp -s $dir/jerasure.$shard $dir/isa.$shard && continue
+        differ=$((differ + 1))
+        objectstore_tool $dir ${osds[$shard]} obj get-bytes \
+            > $dir/disk.$shard || return 1
+        cmp $dir/disk.$shard $dir/jerasure.$shard || return 1
+    done
+    test $differ -gt 0 || return 1
+    #
+    # now that OSDs with the tentacle feature have booted, they may be
+    # Tentacle releases that encode with isa: new profiles must set the
+    # key, and isa is accepted because every up OSD has the feature.
+    # Profiles without the key are left alone: their pools may have
+    # been written with isa.
+    #
+    expect_failure $dir 'set default-layer-plugin explicitly' \
+        ceph osd erasure-code-profile set p2 plugin=lrc k=2 m=2 l=2 \
+        crush-failure-domain=osd || return 1
+    ceph osd erasure-code-profile set p2 plugin=lrc k=2 m=2 l=2 \
+        crush-failure-domain=osd default-layer-plugin=isa || return 1
+    ceph osd erasure-code-profile get p2 | \
+        grep default-layer-plugin=isa || return 1
+    ceph config set mon mon_debug_no_lrc_layer_plugin_record true || return 1
+    ceph osd erasure-code-profile set p3 $lrc || return 1
+    ceph config set mon mon_debug_no_lrc_layer_plugin_record false || return 1
+    sleep 15 # a few ticks
+    ! ceph osd erasure-code-profile get p3 | \
+        grep default-layer-plugin || return 1
+
+    teardown $dir || return 1
+}
+
 main test-erasure-code-lrc-layer-plugin "$@"

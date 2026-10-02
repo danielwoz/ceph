@@ -1145,6 +1145,8 @@ void OSDMonitor::on_active()
       convert_pool_priorities();
       priority_convert = true;
     }
+    if (is_writeable() && maybe_record_lrc_layer_plugin())
+      propose_pending();
   } else {
     list<MonOpRequestRef> ls;
     take_all_failures(ls);
@@ -5325,6 +5327,10 @@ void OSDMonitor::tick()
     do_propose = true;
   }
 
+  if (maybe_record_lrc_layer_plugin()) {
+    do_propose = true;
+  }
+
   // mark down osds out?
 
   /* can_mark_out() checks if we can mark osds as being out. The -1 has no
@@ -7841,6 +7847,41 @@ int OSDMonitor::prepare_lrc_layer_plugin(const string& profilename,
     return -EINVAL;
   }
   return 0;
+}
+
+// While require_osd_release is older than tentacle and no OSD has
+// booted with the tentacle feature, every LRC layer that does not name
+// a plugin was written with jerasure. Record it in the LRC profiles
+// that do not say, before an OSD that would use isa for them boots.
+bool OSDMonitor::maybe_record_lrc_layer_plugin()
+{
+  if (g_conf().get_val<bool>("mon_debug_no_lrc_layer_plugin_record") ||
+      osdmap.require_osd_release >= ceph_release_t::tentacle)
+    return false;
+  const string key = OSDMap::LRC_LAYER_PLUGIN_KEY;
+  vector<string> names;
+  for (auto& [name, profile] : osdmap.get_erasure_code_profiles()) {
+    auto plugin = profile.find("plugin");
+    if (plugin == profile.end() || plugin->second != "lrc" ||
+	OSDMap::lrc_profile_has_layer_plugin(profile) ||
+	pending_inc.has_erasure_code_profile(name) ||
+	std::find(pending_inc.old_erasure_code_profiles.begin(),
+		  pending_inc.old_erasure_code_profiles.end(),
+		  name) != pending_inc.old_erasure_code_profiles.end())
+      continue;
+    names.push_back(name);
+  }
+  if (names.empty() || any_osd_has_run_tentacle())
+    return false;
+  for (auto& name : names) {
+    auto profile = osdmap.get_erasure_code_profile(name);
+    profile[key] = "jerasure";
+    pending_inc.set_erasure_code_profile(name, profile);
+    mon.clog->info() << "recorded " << key << "=jerasure in erasure code"
+		     << " profile '" << name << "': no OSD has run Tentacle"
+		     << " or later yet";
+  }
+  return true;
 }
 
 int OSDMonitor::crush_rule_create_erasure(const string &name,

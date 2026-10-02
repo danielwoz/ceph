@@ -513,6 +513,7 @@ private:
   int prepare_lrc_layer_plugin(const std::string& profilename,
 			       ceph::ErasureCodeProfile &profile,
 			       std::ostream *ss);
+  bool maybe_record_lrc_layer_plugin();
   int crush_rule_create_erasure(const std::string &name,
 				const std::string &profile,
 				int *rule,

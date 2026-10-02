@@ -345,6 +345,12 @@ function TEST_lrc_default_layer_plugin_pre_tentacle() {
     ceph osd erasure-code-profile get default | \
         grep default-layer-plugin=jerasure || return 1
     #
+    # the commands recorded it themselves, not the leader
+    #
+    sleep 15
+    ! ceph log last 100 | \
+        grep "recorded default-layer-plugin=jerasure in erasure code profile 'default'" || return 1
+    #
     # once an OSD running Tentacle or later has booted, a new profile
     # may be used by OSDs that encode with isa: it must set the key
     #
