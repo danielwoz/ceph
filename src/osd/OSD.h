@@ -1987,12 +1987,21 @@ public:
 
 protected:
   PG* _make_pg(OSDMapRef createmap, spg_t pgid);
+  void maybe_use_newer_lrc_layer_plugin(
+    const OSDMapRef& createmap,
+    spg_t pgid,
+    const pg_pool_t& pi,
+    std::map<std::string,std::string> *ec_profile);
 
   bool maybe_wait_for_max_pg(const OSDMapRef& osdmap,
 			     spg_t pgid, bool is_mon_create);
   void resume_creating_pg();
 
   void load_pgs();
+  /// LRC pool -> default-layer-plugin of the PGs load_pgs() built for it,
+  /// until the OSD is up
+  std::map<int64_t, std::string> lrc_layer_plugin_at_load;
+  bool lrc_layer_plugin_changed_since_load(const OSDMapRef& newmap);
 
   epoch_t last_pg_create_epoch;
 

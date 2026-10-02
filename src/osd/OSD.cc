@@ -5151,6 +5151,7 @@ PG* OSD::_make_pg(
     name = createmap->get_pool_name(pgid.pool());
     if (pi.is_erasure()) {
       ec_profile = createmap->get_erasure_code_profile(pi.erasure_code_profile);
+      maybe_use_newer_lrc_layer_plugin(createmap, pgid, pi, &ec_profile);
     }
   } else {
     // pool was deleted; grab final pg_pool_t off disk.
@@ -5181,6 +5182,89 @@ PG* OSD::_make_pg(
   else
     ceph_abort();
   return pg;
+}
+
+// _make_pg() builds a PG from createmap: for load_pgs() the map of the
+// epoch the PG last persisted, which can be up to
+// osd_pg_epoch_persisted_max_stale epochs old, and for a split child the
+// map of the split.  Take the plugin of the LRC layers that do not name
+// one from the newest map instead, so that a recorded or changed value
+// applies once the PG is instantiated again.  Nothing else is taken from
+// the newer map.
+void OSD::maybe_use_newer_lrc_layer_plugin(
+  const OSDMapRef& createmap,
+  spg_t pgid,
+  const pg_pool_t& pi,
+  map<string,string> *ec_profile)
+{
+  auto plugin = ec_profile->find("plugin");
+  if (plugin == ec_profile->end() || plugin->second != "lrc") {
+    return;
+  }
+  OSDMapRef curmap = get_osdmap();
+  if (!curmap || curmap->get_epoch() <= createmap->get_epoch()) {
+    return;
+  }
+  const pg_pool_t *cur_pi = curmap->get_pg_pool(pgid.pool());
+  if (!cur_pi || cur_pi->erasure_code_profile != pi.erasure_code_profile) {
+    return;
+  }
+  const auto& cur_profile =
+    curmap->get_erasure_code_profile(pi.erasure_code_profile);
+  if (!OSDMap::lrc_profile_has_layer_plugin(cur_profile)) {
+    return;
+  }
+  const string& cur = cur_profile.find(OSDMap::LRC_LAYER_PLUGIN_KEY)->second;
+  string old;
+  auto i = ec_profile->find(OSDMap::LRC_LAYER_PLUGIN_KEY);
+  if (i != ec_profile->end()) {
+    old = i->second;
+  }
+  if (old == cur) {
+    return;
+  }
+  dout(5) << __func__ << " " << pgid << " using "
+	  << OSDMap::LRC_LAYER_PLUGIN_KEY << "=" << cur
+	  << " from osdmap e" << curmap->get_epoch()
+	  << " instead of " << (old.empty() ? "unset" : old)
+	  << " from e" << createmap->get_epoch() << dendl;
+  (*ec_profile)[OSDMap::LRC_LAYER_PLUGIN_KEY] = cur;
+}
+
+// load_pgs() builds the PGs of an LRC pool with the default-layer-plugin
+// of the map the OSD starts with.  If the OSD was down when a newer
+// value was recorded, it only learns about it after its PGs are built.
+// Until the OSD is up, check the maps it receives for that, so that it
+// can shut down before its PGs use the old value.
+bool OSD::lrc_layer_plugin_changed_since_load(const OSDMapRef& newmap)
+{
+  for (auto& [pool, loaded] : lrc_layer_plugin_at_load) {
+    const pg_pool_t *pi = newmap->get_pg_pool(pool);
+    if (!pi) {
+      continue;
+    }
+    const auto& profile =
+      newmap->get_erasure_code_profile(pi->erasure_code_profile);
+    if (!OSDMap::lrc_profile_has_layer_plugin(profile)) {
+      continue;
+    }
+    const string& cur = profile.find(OSDMap::LRC_LAYER_PLUGIN_KEY)->second;
+    if (cur == loaded) {
+      continue;
+    }
+    derr << __func__ << " pool " << pool << " has "
+	 << OSDMap::LRC_LAYER_PLUGIN_KEY << "=" << cur << " in osdmap e"
+	 << newmap->get_epoch() << " but its PGs were loaded with "
+	 << (loaded.empty() ? "unset" : loaded) << dendl;
+    clog->error() << "osd." << whoami << " loaded the PGs of pool '"
+		  << newmap->get_pool_name(pool) << "' with "
+		  << OSDMap::LRC_LAYER_PLUGIN_KEY << "="
+		  << (loaded.empty() ? "unset" : loaded)
+		  << " but osdmap e" << newmap->get_epoch() << " records "
+		  << cur << "; shutting down, start the OSD again to use it";
+    return true;
+  }
+  return false;
 }
 
 void OSD::_get_pgs(vector<PGRef> *v, bool clear_too)
@@ -5404,6 +5488,19 @@ void OSD::load_pgs()
 
     register_pg(pg);
     ++num;
+
+    OSDMapRef curmap = get_osdmap();
+    const pg_pool_t *pi = curmap->get_pg_pool(pgid.pool());
+    if (pi && pi->is_erasure()) {
+      const auto& profile =
+	curmap->get_erasure_code_profile(pi->erasure_code_profile);
+      auto plugin = profile.find("plugin");
+      if (plugin != profile.end() && plugin->second == "lrc") {
+	auto i = profile.find(OSDMap::LRC_LAYER_PLUGIN_KEY);
+	lrc_layer_plugin_at_load[pgid.pool()] =
+	  i == profile.end() ? string() : i->second;
+      }
+    }
   }
   dout(0) << __func__ << " opened " << num << " pgs" << dendl;
 }
@@ -8833,12 +8930,26 @@ void OSD::_committed_osd_maps(epoch_t first, epoch_t last, MOSDMap *m)
     do_shutdown = true;
   }
 
+  bool lrc_layer_plugin_changed = false;
+  if (!lrc_layer_plugin_at_load.empty()) {
+    if (lrc_layer_plugin_changed_since_load(osdmap)) {
+      // do not let the PGs use these maps
+      lrc_layer_plugin_changed = true;
+      do_shutdown = true;
+    } else if (is_active()) {
+      // from now on a change applies when a PG is instantiated again
+      lrc_layer_plugin_at_load.clear();
+    }
+  }
+
   map_lock.unlock();
 
   check_osdmap_features();
 
   // yay!
-  consume_map();
+  if (!lrc_layer_plugin_changed) {
+    consume_map();
+  }
 
   if (need_rebind) {
     // Rebind cluster_messenger after consume_map() so that all shards

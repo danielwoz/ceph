@@ -57,4 +57,165 @@ function TEST_lrc_corpus_v0_92() {
     teardown $dir || return 1
 }
 
+# Wait until each of the given OSDs has the osdmap of the given epoch.
+function wait_for_osd_map() {
+    local epoch=$1
+    shift
+
+    local id
+    for id in "$@" ; do
+        local newest=0
+        local -i i
+        for ((i = 0; i < 60; i++)) ; do
+            newest=$(CEPH_ARGS='' ceph --admin-daemon \
+                $(get_asok_path osd.$id) status | jq -r .newest_map)
+            test "$newest" -ge $epoch && break
+            sleep 1
+        done
+        test "$newest" -ge $epoch || return 1
+    done
+}
+
+# Kill all OSDs at once, so that none of them persists a newer epoch for
+# its PGs while the others go down, and start them again.
+function restart_osds() {
+    local dir=$1
+    local count=$2
+    shift 2
+
+    kill_daemons $dir KILL osd || return 1
+    ceph osd down $(seq 0 $((count - 1))) || return 1
+    local id
+    for id in $(seq 0 $((count - 1))) ; do
+        activate_osd $dir $id "$@" || return 1
+    done
+    wait_for_clean || return 1
+    for id in $(seq 0 $((count - 1))) ; do
+        CEPH_ARGS='' ceph --admin-daemon $(get_asok_path osd.$id) \
+            log flush || return 1
+    done
+}
+
+# Stop the OSDs of shards 0 and 1 of obj. Both are in the first local
+# group, so reading obj then decodes with the global layer and uses its
+# second coding chunk, which jerasure and isa compute differently.
+function kill_shards_0_1() {
+    local dir=$1
+    local poolname=$2
+
+    local -a osds=($(get_osds $poolname obj))
+    kill_daemons $dir KILL osd.${osds[0]} || return 1
+    kill_daemons $dir KILL osd.${osds[1]} || return 1
+    ceph osd down ${osds[0]} ${osds[1]} || return 1
+    wait_for_peered || return 1
+}
+
+function read_obj() {
+    local dir=$1
+    local poolname=$2
+
+    rm -f $dir/COPY
+    timeout 120 rados --pool $poolname get obj $dir/COPY || return 1
+    cmp $dir/ORIGINAL $dir/COPY || return 1
+}
+
+# Reading obj must fail with EIO or return other bytes. A read that
+# times out or fails for another reason fails the test.
+function read_obj_wrong() {
+    local dir=$1
+    local poolname=$2
+
+    rm -f $dir/COPY
+    if timeout 120 rados --pool $poolname get obj $dir/COPY \
+            2> $dir/get.err ; then
+        ! cmp -s $dir/ORIGINAL $dir/COPY || return 1
+    else
+        cat $dir/get.err
+        grep -q 'Input/output error' $dir/get.err || return 1
+    fi
+}
+
+# Wait until the daemon whose log has the given message has exited.
+function wait_for_exit() {
+    local dir=$1
+    local name=$2
+    local message="$3"
+
+    local -i i
+    for ((i = 0; i < 120; i++)) ; do
+        grep -q "$message" $dir/$name.log && break
+        sleep 1
+    done
+    grep -q "$message" $dir/$name.log || return 1
+    kill_daemon $dir/$name.pid 0 || return 1
+}
+
+function TEST_lrc_layer_plugin_change_applies_on_restart() {
+    local dir=$1
+    local poolname=lrcpool
+    local -a osd_args=(--osd-pg-epoch-persisted-max-stale=1000)
+    local lrc="plugin=lrc k=4 m=2 l=3 crush-failure-domain=osd"
+
+    setup $dir || return 1
+    run_mon $dir a || return 1
+    run_mgr $dir x || return 1
+    local id
+    for id in $(seq 0 7) ; do
+        run_osd $dir $id "${osd_args[@]}" || return 1
+    done
+
+    ceph osd erasure-code-profile set p $lrc \
+        default-layer-plugin=jerasure || return 1
+    create_pool $poolname 1 1 erasure p || return 1
+    wait_for_clean || return 1
+    ceph osd set noout || return 1
+
+    dd if=/dev/urandom of=$dir/ORIGINAL bs=1M count=1 || return 1
+    rados --pool $poolname put obj $dir/ORIGINAL || return 1
+    #
+    # The PGs persist their epoch when osd.7 goes down and not again
+    # before the restart. Without taking the layer plugin from the
+    # newest map they would come back with jerasure.
+    #
+    # osd.7 is down when the value changes. It loads its PGs from a map
+    # that predates the change, so it must shut down once it learns
+    # about it, before it can use the old value.
+    #
+    kill_daemons $dir KILL osd.7 || return 1
+    ceph osd down 7 || return 1
+    ceph osd erasure-code-profile set p $lrc default-layer-plugin=isa \
+        --force --yes-i-really-mean-it || return 1
+    wait_for_osd_map $(ceph osd dump -f json | jq .epoch) $(seq 0 6) || return 1
+    ceph osd set noup || return 1
+    activate_osd $dir 7 "${osd_args[@]}" || return 1
+    wait_for_exit $dir osd.7 \
+        "default-layer-plugin=isa in osdmap e[0-9]* but its PGs were loaded with jerasure" || return 1
+    ceph osd unset noup || return 1
+    restart_osds $dir 8 "${osd_args[@]}" || return 1
+    grep -q "using default-layer-plugin=isa from osdmap" $dir/osd.*.log || return 1
+    #
+    # obj was written with jerasure: decoding it with isa does not give
+    # the original bytes back
+    #
+    local -a osds=($(get_osds $poolname obj))
+    kill_shards_0_1 $dir $poolname || return 1
+    read_obj_wrong $dir $poolname || return 1
+    activate_osd $dir ${osds[0]} "${osd_args[@]}" || return 1
+    activate_osd $dir ${osds[1]} "${osd_args[@]}" || return 1
+    wait_for_clean || return 1
+    #
+    # back to jerasure: the same degraded read now succeeds
+    #
+    ceph osd erasure-code-profile set p $lrc default-layer-plugin=jerasure \
+        --force --yes-i-really-mean-it || return 1
+    wait_for_osd_map $(ceph osd dump -f json | jq .epoch) $(seq 0 7) || return 1
+    restart_osds $dir 8 "${osd_args[@]}" || return 1
+    grep -q "using default-layer-plugin=jerasure from osdmap" $dir/osd.*.log || return 1
+    kill_shards_0_1 $dir $poolname || return 1
+    read_obj $dir $poolname || return 1
+
+    ceph osd unset noout || return 1
+    teardown $dir || return 1
+}
+
 main test-erasure-code-lrc-layer-plugin "$@"
