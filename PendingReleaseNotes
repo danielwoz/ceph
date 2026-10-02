@@ -233,6 +233,17 @@
   which defaults to 500.
   This restriction does not apply to operator-initiated scrubs, nor to repair scrubs.
   It can be disabled by setting ``osd_scrub_queued_snaptrims_limit`` to 0.
+* RADOS: LRC erasure code profiles now record the plugin used by layers
+  that do not name one, in the new ``default-layer-plugin`` key. Tentacle
+  switched these layers from Jerasure to ISA-L without recording it, so LRC
+  pools created before Tentacle could return wrong data or EIO when a read
+  or recovery had to use two or more coding chunks of a layer; the Tentacle
+  note that upgraded pools keep their plugin did not hold for LRC layers.
+  When the monitors are upgraded before any OSD has run Tentacle, existing
+  LRC profiles are set to ``jerasure`` automatically. Clusters that already
+  ran Tentacle or Umbrella get the POOL_LRC_LAYER_PLUGIN_UNSET health
+  warning; see the LRC documentation. Do not downgrade to a release without
+  this change if a profile sets ``default-layer-plugin=jerasure``.
 * RGW: Add SSE-KMS secrets cache
 * RGW: New buckets now default to the FIFO bilog backend instead of the
   older InIndex (omap-based) backend, controlled by the new

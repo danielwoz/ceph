@@ -65,6 +65,7 @@ To create a new LRC erasure code profile:
       [crush-locality={bucket-type}] \
       [crush-failure-domain={bucket-type}] \
       [crush-device-class={device-class}] \
+      [default-layer-plugin={jerasure|isa}] \
       [directory={directory}] \
       [--force]
 
@@ -144,6 +145,26 @@ Where:
 :Required: No.
 :Default:
 
+``default-layer-plugin={jerasure|isa}``
+
+:Description: The erasure code plugin used by layers that do not set
+              ``plugin`` themselves. The monitors record it when the
+              profile is created: ``isa`` on clusters whose
+              ``require_osd_release`` is Tentacle or later, and
+              ``jerasure`` on older clusters where no OSD has run
+              Tentacle or a later release yet. On an older cluster
+              where such an OSD has run, it must be set explicitly.
+              LRC pools created before Tentacle were written with
+              ``jerasure``. While ``require_osd_release`` is older than
+              Tentacle, the monitors refuse ``isa`` unless every up OSD
+              runs Tentacle or later, because older OSDs ignore this
+              parameter and use ``jerasure``. See
+              :ref:`lrc-pools-created-before-tentacle`.
+
+:Type: String
+:Required: No.
+:Default: isa
+
 ``directory={directory}``
 
 :Description: Set the ``directory`` name from which the erasure code
@@ -188,6 +209,9 @@ loss of chunk *7* can be recovered with the last four chunks. And the
 loss of chunk *2* can be recovered with the first four
 chunks.
 
+Each layer has its own erasure code profile. A layer whose profile does
+not set ``plugin`` uses the plugin named by ``default-layer-plugin``.
+
 Erasure Code Profile Examples Using Low-Level Configuration
 ===========================================================
 
@@ -195,8 +219,9 @@ Minimal Testing
 ---------------
 
 The following example is strictly equivalent to using a *k=2*, *m=1* erasure code profile. The ``DD``
-implies *k=2*, the ``c`` implies *m=1* and the *isa* plugin is used
-by default:
+implies *k=2*, the ``c`` implies *m=1* and the plugin named by
+``default-layer-plugin`` is used (``isa`` for profiles created on
+Tentacle or later):
 
 .. prompt:: bash #
 
@@ -253,8 +278,9 @@ the same rack as the lost chunk.
 Testing with Different Erasure Code Backends
 --------------------------------------------
 
-LRC now uses ISA as the default EC backend. It is possible to
-specify the EC backend/algorithm on a per-layer basis using the low-level
+Layers that do not set ``plugin`` use the EC backend named by
+``default-layer-plugin``. It is possible to specify the EC
+backend/algorithm on a per-layer basis using the low-level
 configuration. The second argument in ``layers='[ [ "DDc", "" ] ]'``
 is actually an erasure code profile to be used for this level. The
 example below specifies the Jerasure backend with the cauchy technique to
@@ -282,6 +308,55 @@ layer:
                 [ "____cDDD", "plugin=jerasure" ],
               ]'
    # ceph osd pool create lrcpool erasure LRCprofile
+
+
+.. _lrc-pools-created-before-tentacle:
+
+LRC Pools Created Before Tentacle
+=================================
+
+Before Tentacle, layers that did not set ``plugin`` used the *jerasure*
+plugin. Tentacle changed this to *isa* without recording it in the
+profile. The two plugins compute the same first coding chunk of a layer
+but different further coding chunks. If an LRC pool written with
+*jerasure* is read with *isa*, a read or a recovery that needs two or more
+coding chunks of the same layer returns wrong data or ``EIO``. This
+happens for example when two chunks of the same local group are lost.
+
+The ``default-layer-plugin`` parameter records the plugin used by these
+layers. Tentacle and Umbrella releases that do not support it ignore it
+and use *isa*.
+
+When upgrading from Squid or an earlier release:
+
+#. Upgrade the monitors first. While ``require_osd_release`` is older
+   than Tentacle and no OSD has run Tentacle or a later release, the
+   leader monitor records ``default-layer-plugin=jerasure`` in every LRC
+   profile that does not set it, and logs this in the cluster log.
+
+#. Before upgrading the OSDs, check that every LRC profile shows
+   ``default-layer-plugin=jerasure``:
+
+   .. prompt:: bash #
+
+      ceph osd erasure-code-profile get {name}
+
+#. Upgrade the OSDs directly to a release that supports
+   ``default-layer-plugin``, not to a Tentacle or Umbrella release that
+   does not.
+
+Do not downgrade the OSDs to a release that does not support
+``default-layer-plugin`` if a profile sets it to ``jerasure``.
+
+If the :ref:`POOL_LRC_LAYER_PLUGIN_UNSET <pool-lrc-layer-plugin-unset>`
+health check is raised, follow the procedure described there.
+
+A changed ``default-layer-plugin`` applies to a placement group only when
+the placement group is instantiated again: when its OSD restarts, or when
+it is split. Restart the OSDs that serve the pool after changing it. An
+OSD that was down when the value was recorded or changed shuts down with
+a cluster log error when it learns about the new value, before using the
+old one. Start such an OSD again.
 
 
 Erasure Coding and Decoding Algorithm

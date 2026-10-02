@@ -1727,6 +1727,65 @@ To disable this health check, run the following command:
 Note that disabling this health check is not recommended.
 
 
+.. _pool-lrc-layer-plugin-unset:
+
+POOL_LRC_LAYER_PLUGIN_UNSET
+___________________________
+
+One or more erasure-coded pools use an LRC profile that does not set
+``default-layer-plugin`` and that has layers that do not set ``plugin``.
+These layers use the *isa* plugin, but before Tentacle they used the
+*jerasure* plugin. If such a pool was created before the cluster was
+upgraded to Tentacle, a read or a recovery that needs two or more coding
+chunks of the same layer can return wrong data or ``EIO``. Reads that do
+not have to rebuild missing chunks are not affected. For more information,
+see :ref:`lrc-pools-created-before-tentacle`.
+
+``ceph health detail`` lists each affected pool with its erasure code
+profile and its creation time. Compare the creation time with the time
+when the OSDs of the cluster first ran Tentacle or Umbrella.
+
+If the pool was created on Tentacle or later, it uses *isa* already.
+Record this in the profile by running the same ``set`` command with the
+parameters shown by ``get`` and ``default-layer-plugin=isa``:
+
+.. prompt:: bash #
+
+   ceph osd erasure-code-profile get <profile>
+   ceph osd erasure-code-profile set <profile> <key=value> ... default-layer-plugin=isa
+
+This changes nothing for the pool, so ``--force`` is not needed.
+
+If the pool was created before the upgrade to Tentacle and nothing has
+been written to it since the OSDs were upgraded, record *jerasure* in the
+profile:
+
+.. prompt:: bash #
+
+   ceph osd set noout
+   ceph osd erasure-code-profile set <profile> <key=value> ... default-layer-plugin=jerasure --force --yes-i-really-mean-it
+
+Restart the OSDs that serve the pool, and then run the following command:
+
+.. prompt:: bash #
+
+   ceph osd unset noout
+
+If the pool was created before the upgrade to Tentacle and has been
+written to since the OSDs were upgraded, it holds objects encoded with
+both plugins. While the cluster is ``HEALTH_OK``, copy the objects into a
+new pool whose profile records ``default-layer-plugin``, and then remove
+the old pool. Alternatively, record *jerasure* as described above and then
+rewrite every object that was written since the OSDs were upgraded.
+
+To silence this health check, run one of the following commands:
+
+.. prompt:: bash #
+
+   ceph health mute POOL_LRC_LAYER_PLUGIN_UNSET
+   ceph config set mon mon_warn_on_lrc_layer_plugin_unset false
+
+
 POOL_TOO_FEW_PGS
 ________________
 
